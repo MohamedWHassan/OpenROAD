@@ -24,6 +24,12 @@ source $tracks_file
 # remove buffers inserted by synthesis
 remove_buffers
 
+################################################################
+# DFT insertion (scan replace + chain stitching before placement)
+set_dft_config -max_length 50
+scan_replace
+execute_dft_plan
+
 if { $pre_placed_macros_file != "" } {
   source $pre_placed_macros_file
 }
@@ -168,6 +174,13 @@ set verilog_file [make_result_file ${design}_${platform}.v]
 write_verilog $verilog_file
 
 ################################################################
+# Scan chain optimization (post-placement)
+if { [info exists ::env(USE_SCAN_OPT)] && $::env(USE_SCAN_OPT) } {
+  scan_opt
+  report_dft_plan -verbose
+}
+
+################################################################
 # Global routing
 
 pin_access
@@ -206,6 +219,38 @@ utl::metric "DRT::drv" $drv_count
 
 set routed_db [make_result_file ${design}_${platform}_route.db]
 write_db $routed_db
+
+if { [info exists ::env(TOTAL_WIRE_LENGTH)] && $::env(TOTAL_WIRE_LENGTH) } {
+  puts "=== Total routed wirelength calculation is enabled ==="
+
+  # Collect all nets connected to SCD (scan-in) pins — one net per scan chain edge.
+  set block [ord::get_db_block]
+  set scan_net_names {}
+  foreach inst [$block getInsts] {
+    foreach iterm [$inst getITerms] {
+      if { [[$iterm getMTerm] getName] eq "SCD" } {
+        set net [$iterm getNet]
+        if { $net ne "NULL" } {
+          lappend scan_net_names [$net getName]
+        }
+      }
+    }
+  }
+  set scan_net_names [lsort -unique $scan_net_names]
+
+  set scan_wl_file [make_result_file scan_chain_wl.rpt]
+  report_wire_length -net $scan_net_names -detailed_route -file $scan_wl_file
+
+  set scan_total 0.0
+  set fp [open $scan_wl_file r]
+  while { [gets $fp line] >= 0 } {
+    if { [regexp {^drt: \S+ ([0-9.]+)} $line -> wl] } {
+      set scan_total [expr {$scan_total + $wl}]
+    }
+  }
+  close $fp
+  puts "=== Scan chain nets ([llength $scan_net_names] nets) routed wirelength: ${scan_total} um ==="
+}
 
 set routed_def [make_result_file ${design}_${platform}_route.def]
 write_def $routed_def
