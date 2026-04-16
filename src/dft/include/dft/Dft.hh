@@ -87,8 +87,11 @@ class Dft
   // Prints to stdout
   void reportDftConfig() const;
 
-  // Performs scan optimizations on the netlist
-  void scanOpt();
+  // Performs scan optimizations on the netlist.
+  // spatial_cluster: when true (default), runs k-means pre-clustering to
+  // reassign cells across chains before per-chain wirelength optimization.
+  // Pass false to skip pre-clustering (useful for A/B comparison).
+  void scanOpt(bool spatial_cluster = true);
 
  private:
   // If we need to run pre_dft to create the internal state

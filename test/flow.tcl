@@ -26,7 +26,11 @@ remove_buffers
 
 ################################################################
 # DFT insertion (scan replace + chain stitching before placement)
-set_dft_config -max_length 50
+set max_length 50
+if { [info exists ::env(MAX_LENGTH)] } {
+  set max_length $::env(MAX_LENGTH)
+}
+set_dft_config -max_length ${max_length}
 scan_replace
 execute_dft_plan
 
@@ -176,7 +180,13 @@ write_verilog $verilog_file
 ################################################################
 # Scan chain optimization (post-placement)
 if { [info exists ::env(USE_SCAN_OPT)] && $::env(USE_SCAN_OPT) } {
-  scan_opt
+  
+  if { [info exists ::env(SPATIAL_CLUSTER)] && $::env(SPATIAL_CLUSTER) } {
+    scan_opt
+  } else {
+    scan_opt -no_spatial_cluster
+  }
+
   report_dft_plan -verbose
 }
 

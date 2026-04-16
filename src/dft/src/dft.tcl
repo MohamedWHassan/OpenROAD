@@ -98,13 +98,15 @@ proc report_dft_config { args } {
 }
 
 
-sta::define_cmd_args "scan_opt" { }
+sta::define_cmd_args "scan_opt" { [-no_spatial_cluster] }
 proc scan_opt { args } {
   sta::parse_key_args "scan_opt" args \
-    keys {} flags {}
+    keys {} flags {-no_spatial_cluster}
+
+  set spatial_cluster [expr { ![info exists flags(-no_spatial_cluster)] }]
 
   if { [ord::get_db_block] == "NULL" } {
     utl::error DFT 13 "No design block found."
   }
-  dft::scan_opt
+  dft::scan_opt $spatial_cluster
 }

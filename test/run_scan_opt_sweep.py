@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-Sweep aes_sky130hd.tcl (via flow.tcl) across floorplan areas. For each area,
-two runs are performed:
-  - baseline:  no scan_opt
-  - scan_opt:  with scan_opt enabled
+Sweep aes_sky130hd.tcl (via flow.tcl) across scan chain max lengths.
+For each length, three runs are performed:
+  - baseline:             no scan_opt
+  - scan_opt_no_cluster:  scan_opt without spatial pre-clustering
+  - scan_opt_with_cluster: scan_opt with k-means spatial pre-clustering
 
-The die is always square; DIE_SIZE sets the side length in um. Core margins are
-fixed at 30um (left/bottom) and 230um (right/top), matching the aes defaults.
+MAX_LENGTH sets the scan chain max length passed to set_dft_config.
 
 Usage (from the test/ directory):
-    python3 run_scan_opt_sweep.py [--areas 1800 2000 2200] \\
+    python3 run_scan_opt_sweep.py [--lengths 50 100 200] \\
                                   [--output-dir sweep_results]
 
 Outputs are organised as:
-    <output-dir>/area_<size>/baseline/run.log
-    <output-dir>/area_<size>/scan_opt/run.log
+    <output-dir>/length_<n>/baseline/run.log
+    <output-dir>/length_<n>/scan_opt_no_cluster/run.log
+    <output-dir>/length_<n>/scan_opt_with_cluster/run.log
 
 Scan chain wirelength is printed in each run.log (TOTAL_WIRE_LENGTH=1).
 """
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -29,7 +29,7 @@ from pathlib import Path
 # --- Configuration -----------------------------------------------------------
 OPENROAD_BIN = Path("../../install/OpenROAD/bin/openroad")
 TCL_SCRIPT = Path("aes_sky130hd.tcl")
-DEFAULT_AREAS = [2000]  # die side in um; extend with e.g. [1800, 2000, 2200]
+DEFAULT_LENGTH = [50]
 # -----------------------------------------------------------------------------
 
 
@@ -55,18 +55,19 @@ def run_openroad(env: dict, results_dir: Path, log_path: Path) -> int:
 
 
 SCENARIOS: list[tuple[str, dict]] = [
-    ("baseline", {"TOTAL_WIRE_LENGTH": "1", "USE_SCAN_OPT": "0"}),
-    ("scan_opt", {"TOTAL_WIRE_LENGTH": "1", "USE_SCAN_OPT": "1"}),
+    ("baseline", {"TOTAL_WIRE_LENGTH": "1", "USE_SCAN_OPT": "0", "SPATIAL_CLUSTER": "0"}),
+    ("scan_opt_no_cluster", {"TOTAL_WIRE_LENGTH": "1", "USE_SCAN_OPT": "1", "SPATIAL_CLUSTER": "0"}),
+    ("scan_opt_with_cluster", {"TOTAL_WIRE_LENGTH": "1", "USE_SCAN_OPT": "1", "SPATIAL_CLUSTER": "1"}),
 ]
 
 
 def main():
     parser = argparse.ArgumentParser(description="Sweep scan_opt and floorplan areas")
     parser.add_argument(
-        "--areas",
+        "--lengths",
         type=int,
         nargs="+",
-        default=DEFAULT_AREAS,
+        default=DEFAULT_LENGTH,
         metavar="UM",
         help="Die side lengths in um to sweep (default: %(default)s)",
     )
@@ -90,16 +91,16 @@ def main():
     print(f"Output root: {output_root.resolve()}\n")
 
     results = []
-    for area in args.areas:
+    for length in args.lengths:
         for label, env in SCENARIOS:
-            full_label = f"area_{area}/{label}"
+            full_label = f"length_{length}/{label}"
             print(f"{'='*60}")
             print(f"Run: {full_label}")
-            run_dir = output_root / f"area_{area}" / label
+            run_dir = output_root / f"length_{length}" / label
             log_path = run_dir / "run.log"
 
             run_env = dict(env)
-            run_env["DIE_SIZE"] = str(area)
+            run_env["MAX_LENGTH"] = str(length)
 
             rc = run_openroad(run_env, run_dir, log_path)
 

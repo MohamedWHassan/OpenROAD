@@ -286,7 +286,7 @@ std::vector<std::unique_ptr<ScanChain>> Dft::scanArchitect()
   return scan_architect->getScanChains();
 }
 
-void Dft::scanOpt()
+void Dft::scanOpt(bool spatial_cluster)
 {
   odb::dbBlock* block = db_->getChip()->getBlock();
   odb::dbDft* db_dft = block->getDft();
@@ -296,8 +296,9 @@ void Dft::scanOpt()
   // clock domain so that each chain holds a spatially compact set of cells.
   // This runs before per-chain optimization; it updates both dbScanList
   // membership and SI→SO nets via RestitchChain.
+  // Skipped when spatial_cluster is false (e.g. scan_opt -no_spatial_cluster).
   // ---------------------------------------------------------------------------
-  {
+  if (spatial_cluster) {
     // Group chains by (clock_name, clock_edge).  Only chains with the same
     // domain can share cells.
     using DomainKey = std::pair<std::string, odb::dbScanInst::ClockEdge>;
