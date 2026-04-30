@@ -1,60 +1,38 @@
-## SPDX-License-Identifier: BSD-3-Clause
-## Copyright (c) 2019-2026, The OpenROAD Authors
+# Test scan_opt on AES (530 FFs): compare routed wirelength with/without optimization
+# Give USE_SCAN_OPT=1 flag for optimized
+# Give TOTAL_WIRE_LENGTH=1 flag to calculate the total scan chain wire length
 
-# Assumes flow_helpers.tcl has been read.
+source "helpers.tcl"
+source "flow_helpers.tcl"
+source "sky130hd/sky130hd.vars"
+
 read_libraries
-read_verilog $synth_verilog
-link_design $top_module
-read_sdc $sdc_file
+read_verilog aes_sky130hd.v
+link_design aes_cipher_top
 
-set_thread_count [cpu_count]
-# Temporarily disable sta's threading due to random failures
-sta::set_thread_count 1
+read_sdc aes_sky130hd.sdc
 
-utl::metric "IFP::ord_version" [ord::openroad_git_describe]
-# Note that sta::network_instance_count is not valid after tapcells are added.
-utl::metric "IFP::instance_count" [sta::network_instance_count]
-
+# Floorplan
 initialize_floorplan -site $site \
-  -die_area $die_area \
-  -core_area $core_area
+  -die_area {0 0 2000 2000} \
+  -core_area {30 30 1770 1770}
 
 source $tracks_file
 
-# remove buffers inserted by synthesis
-remove_buffers
-
-################################################################
-# DFT insertion (scan replace + chain stitching before placement)
-set max_length 50
-if { [info exists ::env(MAX_LENGTH)] } {
-  set max_length $::env(MAX_LENGTH)
-}
-set_dft_config -max_length ${max_length}
-scan_replace
-execute_dft_plan
-
-if { $pre_placed_macros_file != "" } {
-  source $pre_placed_macros_file
-}
-
-################################################################
-# Macro Placement
-if { [have_macros] } {
-  lassign $macro_place_halo halo_x halo_y
-  set report_dir [make_result_file ${design}_${platform}_rtlmp]
-  rtl_macro_placer -halo_width $halo_x -halo_height $halo_y \
-    -report_directory $report_dir
-}
-
 ################################################################
 # Tapcell insertion
-eval tapcell $tapcell_args ;# tclint-disable command-args
+eval tapcell $tapcell_args
 
 ################################################################
 # Power distribution network insertion
 source $pdn_cfg
 pdngen
+
+################################################################
+# DFT insertion
+set_dft_config -max_length 10
+scan_replace
+execute_dft_plan
 
 ################################################################
 # Global placement
@@ -161,6 +139,7 @@ utl::metric "RSZ::worst_slack_max" [sta::worst_slack -max]
 utl::metric "RSZ::tns_max" [sta::total_negative_slack -max]
 utl::metric "RSZ::hold_buffer_count" [rsz::hold_buffer_count]
 
+
 ################################################################
 # Detailed Placement
 
@@ -178,39 +157,26 @@ set verilog_file [make_result_file ${design}_${platform}.v]
 write_verilog $verilog_file
 
 ################################################################
-# Scan chain optimization (post-placement)
-if { [info exists ::env(USE_SCAN_OPT)] && $::env(USE_SCAN_OPT) } {
-
-  set spatial_cluster \
-    [expr { [info exists ::env(SPATIAL_CLUSTER)] && $::env(SPATIAL_CLUSTER) }]
-  set cluster_only \
-    [expr { [info exists ::env(CLUSTER_ONLY)] && $::env(CLUSTER_ONLY) }]
-
-  set opts {}
-  if { !$spatial_cluster } { lappend opts "-no_spatial_cluster" }
-  if { $cluster_only }     { lappend opts "-cluster_only" }
-  scan_opt {*}$opts
-
-  report_dft_plan -verbose
+# Optionally optimize scan chain
+if {[info exists ::env(USE_SCAN_OPT)] && $::env(USE_SCAN_OPT)} {
+  set cong_weight 0.0
+  if {[info exists ::env(CONGESTION_WEIGHT)]} {
+    set cong_weight $::env(CONGESTION_WEIGHT)
+  }
+  puts "=== Running scan_opt (congestion_weight=$cong_weight) ==="
+  scan_opt -congestion_weight $cong_weight
+} else {
+  puts "=== Skipping scan_opt (baseline) ==="
 }
-
-# Always emit chain metrics so sweep harnesses can collect them
-# (including the baseline run where scan_opt was skipped).
-puts "=== chain_metrics ==="
-report_chain_metrics
-puts "=== end chain_metrics ==="
 
 ################################################################
 # Global routing
 
 pin_access
-
-set route_guide [make_result_file ${design}_${platform}.route_guide]
+set route_guide [make_result_file scan_opt_aes.route_guide]
 global_route -guide_file $route_guide \
+  -congestion_report_file congestion.rpt \
   -congestion_iterations 100 -verbose
-
-set verilog_file [make_result_file ${design}_${platform}.v]
-write_verilog -remove_cells $filler_cells $verilog_file
 
 ################################################################
 # Repair antennas post-GRT
@@ -227,9 +193,8 @@ utl::metric "GRT::ANT::errors" [ant::antenna_violation_count]
 
 # Run pin access again after inserting diodes and moving cells
 # pin_access
-
-detailed_route -output_drc [make_result_file "${design}_${platform}_route_drc.rpt"] \
-  -output_maze [make_result_file "${design}_${platform}_maze.log"] \
+detailed_route -output_drc [make_result_file "scan_opt_aes_drc.rpt"] \
+  -output_maze [make_result_file "scan_opt_aes_maze.log"] \
   -no_pin_access \
   -verbose 0
 
@@ -240,17 +205,25 @@ utl::metric "DRT::drv" $drv_count
 set routed_db [make_result_file ${design}_${platform}_route.db]
 write_db $routed_db
 
-if { [info exists ::env(TOTAL_WIRE_LENGTH)] && $::env(TOTAL_WIRE_LENGTH) } {
+set routed_def [make_result_file ${design}_${platform}_route.def]
+write_def $routed_def
+
+##############################################################
+################## Report total wirelength ###################
+##############################################################
+
+if {[info exists ::env(TOTAL_WIRE_LENGTH)] && $::env(TOTAL_WIRE_LENGTH)} {
+
   puts "=== Total routed wirelength calculation is enabled ==="
 
-  # Collect all nets connected to SCD (scan-in) pins — one net per scan chain edge.
+  # Report scan chain nets only
   set block [ord::get_db_block]
   set scan_net_names {}
   foreach inst [$block getInsts] {
     foreach iterm [$inst getITerms] {
-      if { [[$iterm getMTerm] getName] eq "SCD" } {
+      if {[[$iterm getMTerm] getName] eq "SCD"} {
         set net [$iterm getNet]
-        if { $net ne "NULL" } {
+        if {$net ne "NULL"} {
           lappend scan_net_names [$net getName]
         }
       }
@@ -258,22 +231,21 @@ if { [info exists ::env(TOTAL_WIRE_LENGTH)] && $::env(TOTAL_WIRE_LENGTH) } {
   }
   set scan_net_names [lsort -unique $scan_net_names]
 
-  set scan_wl_file [make_result_file scan_chain_wl.rpt]
+  set scan_wl_file [make_result_file scan_chain_aes_wl.rpt]
   report_wire_length -net $scan_net_names -detailed_route -file $scan_wl_file
 
   set scan_total 0.0
   set fp [open $scan_wl_file r]
-  while { [gets $fp line] >= 0 } {
-    if { [regexp {^drt: \S+ ([0-9.]+)} $line -> wl] } {
+  while {[gets $fp line] >= 0} {
+    if {[regexp {^drt: \S+ ([0-9.]+)} $line -> wl]} {
       set scan_total [expr {$scan_total + $wl}]
     }
   }
   close $fp
   puts "=== Scan chain nets ([llength $scan_net_names] nets) routed wirelength: ${scan_total} um ==="
+} else {
+  puts "=== Total routed wirelength calculation is disabled ==="
 }
-
-set routed_def [make_result_file ${design}_${platform}_route.def]
-write_def $routed_def
 
 ################################################################
 # Repair antennas post-DRT
@@ -359,6 +331,5 @@ utl::metric "DRT::max_capacitance_slack" [expr [sta::max_capacitance_check_slack
 # report clock period as a metric for updating limits
 utl::metric "DRT::clock_period" [get_property [lindex [all_clocks] 0] period]
 
-# not really useful without pad locations
-#set_pdnsim_net_voltage -net $vdd_net_name -voltage $vdd_voltage
-#analyze_power_grid -net $vdd_net_name
+
+puts "pass"
