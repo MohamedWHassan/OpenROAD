@@ -286,7 +286,99 @@ std::vector<std::unique_ptr<ScanChain>> Dft::scanArchitect()
   return scan_architect->getScanChains();
 }
 
-void Dft::scanOpt(bool spatial_cluster)
+namespace {
+
+// Half-perimeter of the bounding box of a set of points.  O(n).
+int64_t computeHPWL(const std::vector<odb::Point>& pts)
+{
+  if (pts.empty()) {
+    return 0;
+  }
+  int xmin = pts[0].x(), xmax = pts[0].x();
+  int ymin = pts[0].y(), ymax = pts[0].y();
+  for (const auto& p : pts) {
+    xmin = std::min(xmin, p.x());
+    xmax = std::max(xmax, p.x());
+    ymin = std::min(ymin, p.y());
+    ymax = std::max(ymax, p.y());
+  }
+  return static_cast<int64_t>(xmax - xmin)
+         + static_cast<int64_t>(ymax - ymin);
+}
+
+// Sum of pairwise Manhattan distances.  O(n²).
+int64_t computeSumPairwise(const std::vector<odb::Point>& pts)
+{
+  int64_t sum = 0;
+  const int n = static_cast<int>(pts.size());
+  for (int i = 0; i < n; i++) {
+    for (int j = i + 1; j < n; j++) {
+      sum += std::abs(static_cast<int64_t>(pts[i].x()) - pts[j].x())
+             + std::abs(static_cast<int64_t>(pts[i].y()) - pts[j].y());
+    }
+  }
+  return sum;
+}
+
+// Manhattan-distance MST length via Prim's algorithm.  O(n²).
+// Lower bound on the optimal tour over the same point set.
+int64_t computeMST(const std::vector<odb::Point>& pts)
+{
+  const int n = static_cast<int>(pts.size());
+  if (n < 2) {
+    return 0;
+  }
+  std::vector<int64_t> min_dist(n, std::numeric_limits<int64_t>::max());
+  std::vector<bool> in_tree(n, false);
+  min_dist[0] = 0;
+  int64_t total = 0;
+
+  for (int iter = 0; iter < n; iter++) {
+    int u = -1;
+    int64_t best = std::numeric_limits<int64_t>::max();
+    for (int v = 0; v < n; v++) {
+      if (!in_tree[v] && min_dist[v] < best) {
+        best = min_dist[v];
+        u = v;
+      }
+    }
+    if (u == -1) {
+      break;
+    }
+    in_tree[u] = true;
+    total += min_dist[u];
+
+    for (int v = 0; v < n; v++) {
+      if (!in_tree[v]) {
+        const int64_t d
+            = std::abs(static_cast<int64_t>(pts[u].x()) - pts[v].x())
+              + std::abs(static_cast<int64_t>(pts[u].y()) - pts[v].y());
+        if (d < min_dist[v]) {
+          min_dist[v] = d;
+        }
+      }
+    }
+  }
+  return total;
+}
+
+// Collects cell origins from every scan inst on the chain.
+std::vector<odb::Point> collectChainOrigins(odb::dbScanChain* chain)
+{
+  std::vector<odb::Point> pts;
+  for (odb::dbScanPartition* part : chain->getScanPartitions()) {
+    for (odb::dbScanList* list : part->getScanLists()) {
+      for (odb::dbScanInst* si : list->getScanInsts()) {
+        pts.push_back(si->getInst()->getOrigin());
+      }
+    }
+  }
+  return pts;
+}
+
+}  // namespace
+
+void Dft::scanOpt(bool spatial_cluster, bool cluster_only)
 {
   odb::dbBlock* block = db_->getChip()->getBlock();
   odb::dbDft* db_dft = block->getDft();
@@ -350,7 +442,32 @@ void Dft::scanOpt(bool spatial_cluster)
       for (const auto& a : adapters) {
         cell_ptrs.push_back(a.get());
       }
-      const std::vector<int> assignments = KMeansClusters(cell_ptrs, k);
+
+      // Re-derive the architect's effective per-chain bit cap from the
+      // existing chain composition.  ScanArchitect tightens the user's
+      // max_length to ceil(total_bits / num_chains); the realised maximum
+      // chain bit count after construction equals that cap.  Stage A
+      // must not exceed it, otherwise the architect's max_length contract
+      // is silently broken.
+      int64_t cap_bits = 0;
+      for (odb::dbScanChain* chain : chains) {
+        int64_t chain_bits = 0;
+        for (odb::dbScanPartition* part : chain->getScanPartitions()) {
+          for (odb::dbScanList* list : part->getScanLists()) {
+            for (odb::dbScanInst* si : list->getScanInsts()) {
+              chain_bits += static_cast<int64_t>(si->getBits());
+            }
+          }
+        }
+        cap_bits = std::max(cap_bits, chain_bits);
+      }
+      // Sanity: a single oversized cell must always fit somewhere.
+      for (const auto& a : adapters) {
+        cap_bits = std::max(cap_bits, static_cast<int64_t>(a->getBits()));
+      }
+
+      const std::vector<int> assignments
+          = KMeansClusters(cell_ptrs, k, cap_bits);
 
       // Partition scan_insts and adapters by cluster index.
       std::vector<std::vector<odb::dbScanInst*>> cluster_insts(k);
@@ -383,10 +500,22 @@ void Dft::scanOpt(bool spatial_cluster)
       logger_->info(utl::DFT,
                     19,
                     "K-means spatial pre-clustering: reassigned {} cells "
-                    "across {} chains.",
+                    "across {} chains (bit cap = {}).",
                     adapters.size(),
-                    k);
+                    k,
+                    cap_bits);
     }
+  }
+
+  // Stage A only: skip per-chain wirelength optimization.  Used to
+  // evaluate clustering quality in isolation (e.g. report_chain_metrics
+  // afterwards).
+  if (cluster_only) {
+    logger_->info(utl::DFT,
+                  20,
+                  "scan_opt -cluster_only: stopping after spatial "
+                  "pre-clustering.");
+    return;
   }
 
   int chains_optimized = 0;
@@ -446,6 +575,54 @@ void Dft::scanOpt(bool spatial_cluster)
 
   logger_->info(
       utl::DFT, 16, "Optimized {} scan chain(s).", chains_optimized);
+}
+
+void Dft::reportChainMetrics()
+{
+  odb::dbBlock* block = db_->getChip()->getBlock();
+  odb::dbDft* db_dft = block->getDft();
+
+  // Header (CSV-friendly for sweep collectors).
+  logger_->report("chain_name,num_cells,hpwl,mst,sum_pairwise");
+
+  int64_t total_hpwl = 0;
+  int64_t total_mst = 0;
+  int64_t total_pairwise = 0;
+  int total_cells = 0;
+  int chain_count = 0;
+
+  for (odb::dbScanChain* chain : db_dft->getScanChains()) {
+    const std::vector<odb::Point> pts = collectChainOrigins(chain);
+    if (pts.empty()) {
+      continue;
+    }
+    const int64_t hpwl = computeHPWL(pts);
+    const int64_t mst = computeMST(pts);
+    const int64_t pw = computeSumPairwise(pts);
+
+    total_hpwl += hpwl;
+    total_mst += mst;
+    total_pairwise += pw;
+    total_cells += static_cast<int>(pts.size());
+    chain_count++;
+
+    logger_->report("{},{},{},{},{}",
+                    chain->getName(),
+                    pts.size(),
+                    hpwl,
+                    mst,
+                    pw);
+  }
+
+  logger_->info(utl::DFT,
+                21,
+                "Chain metrics: chains={}, cells={}, sum_hpwl={}, "
+                "sum_mst={}, sum_pairwise={}",
+                chain_count,
+                total_cells,
+                total_hpwl,
+                total_mst,
+                total_pairwise);
 }
 
 }  // namespace dft
